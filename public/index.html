@@ -129,6 +129,45 @@
         <div id="cap-result" class="result-box hidden"></div>
       </section>
 
+      <section class="card script-card" id="script-card">
+        <div class="jar-head">
+          <h2>📜 document.cookie 演算</h2>
+        </div>
+        <p class="jar-count">模拟<strong>页面里的 JavaScript</strong> 读写 <code>document.cookie</code>：筛选规则同网络请求，但<strong>一律排除 HttpOnly</strong>、<strong>不应用 SameSite</strong>；读取<strong>不刷新最近访问时间</strong>，写入<strong>不能带 HttpOnly、也不能改写或删除未过期的 HttpOnly 项</strong>。</p>
+
+        <label class="field">
+          <span class="field-label">页面 URL（执行脚本的文档地址）</span>
+          <input id="script-url" type="text" spellcheck="false" autocomplete="off"
+            placeholder="例如：https://shop.example.com/admin/dashboard" />
+        </label>
+
+        <label class="field">
+          <span class="field-label">顶层页面 URL（Partitioned 分区键与第三方判定基准；留空 = 与页面 URL 同站/同分区）</span>
+          <input id="script-top-url" type="text" spellcheck="false" autocomplete="off"
+            placeholder="例如：https://embed.example.net/page" />
+        </label>
+
+        <label class="field-nav" title="对应 /api/script/read 与 /api/script/write 的 blockThirdParty 参数">
+          <input id="script-block-3p" type="checkbox" />
+          <span>屏蔽第三方 Cookie（须填有效顶层页面 URL：<strong>跨站页面读不到普通 Cookie</strong>，分区键匹配的 Partitioned 项不受此限）</span>
+        </label>
+
+        <div class="row script-actions">
+          <button id="script-read-btn" class="btn primary small" type="button">读取 document.cookie</button>
+        </div>
+        <div id="script-read-result" class="result-box hidden"></div>
+
+        <label class="field script-write-field">
+          <span class="field-label">document.cookie 赋值串（不含 <code>document.cookie =</code> 前缀；写 <code>HttpOnly</code> 项会被拒绝）</span>
+          <input id="script-cookie" type="text" spellcheck="false" autocomplete="off"
+            placeholder='例如：uiTheme=dark; Path=/; Max-Age=3600; Secure' />
+        </label>
+        <div class="row">
+          <button id="script-write-btn" class="btn primary small" type="button">执行 document.cookie 赋值</button>
+        </div>
+        <div id="script-write-result" class="result-box hidden"></div>
+      </section>
+
       <section class="card jar-card">
         <div class="jar-head">
           <h2>🫙 当前 Cookie 罐</h2>
@@ -158,6 +197,7 @@
         <li><strong>站点（site）：</strong>scheme + 可注册域（eTLD+1，由公共后缀列表 PSL 判定，如 <code>https://example.com</code>）；IP 与 localhost 按完整主机比较。请求站 = 顶层站即「同站」。</li>
         <li><strong>发送限制：</strong><code>Strict</code> 仅同站发送；显式 <code>Lax</code> 仅同站或跨站顶层导航的安全方法（GET/HEAD/OPTIONS/TRACE）发送；<strong>默认 Lax</strong> 额外允许创建不超过 <strong>120 秒</strong>的跨站顶层 POST；<code>None</code> 跨站照常发送（已强制 Secure）。</li>
         <li><strong>屏蔽第三方 Cookie（可选，默认关闭）：</strong>界面开关与 <code>/api/store</code>、<code>/api/send</code> 的 <code>blockThirdParty</code> 参数一一对应。开启后<strong>必须提供有效顶层页面 URL</strong>，按 scheme + 可注册域判定它与响应/请求 URL 是否跨站：<strong>跨站响应拒绝写入和删除普通 Cookie</strong>（不改动罐、不触发容量淘汰），Partitioned 分区项仍按既有 Secure 与分区键规则处理；<strong>跨站请求排除普通 Cookie</strong>（被排除条目不刷新最近访问时间），分区键匹配的 Partitioned 项仍可发送。拒绝/排除结果逐项说明策略原因。</li>
+        <li><strong>document.cookie 脚本演算（右栏「📜 document.cookie 演算」面板，对应 <code>/api/script/read</code>、<code>/api/script/write</code>）：</strong>模拟页面 JS 视角。<strong>读取</strong>按既有 过期 → 分区（Partitioned 分区键）→ 第三方屏蔽 → Domain → Path → Secure 顺序筛选，<strong>最后再排除 HttpOnly</strong>（<code>document.cookie</code> 对脚本不可见）；<strong>不应用 SameSite</strong>，且<strong>不刷新最近访问时间</strong>（纯只读、罐内容不变）；可读项沿用请求头排序（Path 长度降序、创建序号升序），逐项给出可读/不可读原因，并以 <code>; </code> 拼成 <code>document.cookie</code> 字符串。<strong>写入</strong>复用既有解析、分区身份与容量逻辑，但<strong>拒绝带 HttpOnly 的赋值</strong>，也<strong>拒绝覆盖或以 Max-Age&lt;=0 删除同身份（name、domain、path、分区键相同）且未过期的 HttpOnly 项</strong>；已过期的 HttpOnly 项不在保护之列。脚本专属拒绝都在改动罐之前返回，<strong>罐内容、时间戳与容量均不变</strong>。<strong>网络接口 <code>/api/store</code>、<code>/api/send</code> 行为不变</strong>，仍可写入、更新、删除并在请求头中发送 HttpOnly 项。</li>
         <li><strong>排序：</strong>发送时按 Path 长度降序，Path 等长时按首次创建顺序升序，再以 <code>; </code> 拼接成 Cookie 头。</li>
       </ul>
     </details>

@@ -32,6 +32,15 @@ const els = {
   capSave: $('#cap-save'),
   capClear: $('#cap-clear'),
   capResult: $('#cap-result'),
+
+  scriptUrl: $('#script-url'),
+  scriptTopUrl: $('#script-top-url'),
+  scriptBlock3p: $('#script-block-3p'),
+  scriptReadBtn: $('#script-read-btn'),
+  scriptReadResult: $('#script-read-result'),
+  scriptCookie: $('#script-cookie'),
+  scriptWriteBtn: $('#script-write-btn'),
+  scriptWriteResult: $('#script-write-result'),
   toast: null,
 };
 
@@ -249,10 +258,10 @@ function evictionHtml(eviction) {
     </div>`;
 }
 
-function renderStoreResult(data) {
+function renderStoreResult(data, resultEl = els.storeResult) {
   const meta = STORE_BANNER[data.action] || STORE_BANNER.rejected;
-  els.storeResult.classList.remove('hidden');
-  els.storeResult.innerHTML = `
+  resultEl.classList.remove('hidden');
+  resultEl.innerHTML = `
     <div class="banner ${meta.cls}">
       <span class="banner-title">${meta.title}</span>${escapeHtml(data.reason)}
     </div>
@@ -260,6 +269,91 @@ function renderStoreResult(data) {
     ${evictionHtml(data.eviction)}`;
   if (data.jar) renderJar(data.jar);
   if (data.capacity) renderCapacityUsage(data.capacity);
+}
+
+/* ---------- document.cookie 脚本演算 ---------- */
+
+function scriptItemHtml(item) {
+  const ok = item.verdict === 'send';
+  const partBadge = item.partitioned
+    ? `<span class="badge part-on">Partitioned · ${escapeHtml(item.partitionKey)}</span>`
+    : '';
+  const httpBadge = item.httpOnly
+    ? '<span class="badge http">HttpOnly</span>'
+    : '';
+  const tag = ok
+    ? '<span class="tag send">可读</span>'
+    : '<span class="tag exclude">不可读</span>';
+  return `
+    <div class="item ${ok ? 'sent' : 'excluded'}">
+      <div class="item-top">
+        <span class="item-idx">#${item.index}</span>
+        ${tag}
+        <span class="item-cookie">${escapeHtml(item.cookie)}</span>
+        ${httpBadge}
+        ${partBadge}
+      </div>
+      <div class="item-detail">${escapeHtml(item.detail)}</div>
+    </div>`;
+}
+
+function renderScriptReadResult(data) {
+  els.scriptReadResult.classList.remove('hidden');
+
+  if (!data.ok) {
+    els.scriptReadResult.innerHTML = `
+      <div class="banner bad">
+        <span class="banner-title">⛔ 无法演算</span>${escapeHtml(data.error || '页面 URL 非法')}
+      </div>`;
+    return;
+  }
+
+  const strVal = data.cookieString
+    ? escapeHtml(data.cookieString)
+    : '<span class="dim">（空：document.cookie 读不到任何 cookie）</span>';
+
+  const readableHtml = data.readable.length
+    ? `<div class="group-title">👁 可读项（${data.readable.length}，已按 Path 长度降序 / 创建顺序升序排列）</div>
+       <div class="item-list">${data.readable.map(scriptItemHtml).join('')}</div>`
+    : '<div class="group-title">👁 可读项<span class="count">（0）</span></div>';
+
+  const excludedHtml = data.excluded.length
+    ? `<div class="group-title">🚫 不可读项（${data.excluded.length}）</div>
+       <div class="item-list">${data.excluded.map(scriptItemHtml).join('')}</div>`
+    : '';
+
+  const siteBadge = data.sameSiteContext
+    ? '<span class="badge ss-same">同站</span>'
+    : '<span class="badge ss-cross">跨站</span>';
+  const blockBadge = data.blockThirdParty
+    ? '<span class="badge ss-cross">屏蔽第三方 Cookie：开</span>'
+    : '<span class="badge ss-same">屏蔽第三方 Cookie：关</span>';
+
+  els.scriptReadResult.innerHTML = `
+    <div class="meta-line">
+      页面主机 <code>${escapeHtml(data.host)}</code> ·
+      路径 <code>${escapeHtml(data.path)}</code> ·
+      协议 <strong>${data.securePage ? 'https（可读 Secure）' : 'http（不读 Secure）'}</strong>
+    </div>
+    <div class="meta-line">
+      页面站 <code>${escapeHtml(data.pageSite)}</code> vs 顶层站 <code>${escapeHtml(data.topSite)}</code>
+      ${siteBadge} · ${blockBadge} · <span class="dim">document.cookie 读取不应用 SameSite、不刷新最近访问时间</span>
+    </div>
+    <div class="meta-line">
+      🔑 页面分区键（顶层页面 URL 的 scheme + 可注册域）：<code>${escapeHtml(data.partitionKey)}</code>
+    </div>
+    <div class="header-block">
+      <div class="header-line ${data.cookieString ? '' : 'empty'}">
+        <span class="hname">document.cookie =</span>
+        <span class="hval" id="script-cookie-val">${strVal}</span>
+        ${data.cookieString ? '<button class="copy-btn" id="copy-script-cookie" type="button">复制</button>' : ''}
+      </div>
+    </div>
+    ${readableHtml}
+    ${excludedHtml}`;
+
+  const copyBtn = $('#copy-script-cookie');
+  if (copyBtn) copyBtn.addEventListener('click', () => copyText(data.cookieString));
 }
 
 /* ---------- 发送结果 ---------- */
@@ -417,6 +511,8 @@ els.resetBtn.addEventListener('click', async () => {
     els.storeResult.classList.add('hidden');
     els.sendResult.classList.add('hidden');
     els.capResult.classList.add('hidden');
+    els.scriptReadResult.classList.add('hidden');
+    els.scriptWriteResult.classList.add('hidden');
     els.storeCookie.value = '';
     toast('Cookie 罐已重置（容量设置保留）');
   } catch (err) {
@@ -557,6 +653,83 @@ els.capDomains.addEventListener('input', (e) => {
   }
 });
 
+/* ---------- document.cookie 脚本演算事件 ---------- */
+
+els.scriptReadBtn.addEventListener('click', async () => {
+  const url = els.scriptUrl.value.trim();
+  if (!url) {
+    els.scriptReadResult.classList.remove('hidden');
+    els.scriptReadResult.innerHTML =
+      '<div class="banner bad"><span class="banner-title">⛔</span>请先填写页面 URL</div>';
+    return;
+  }
+  els.scriptReadBtn.disabled = true;
+  try {
+    // 纯只读：不刷新最近访问时间，也不要求界面同步罐表格
+    const data = await postJSON('/api/script/read', {
+      url,
+      topUrl: els.scriptTopUrl.value.trim(),
+      blockThirdParty: els.scriptBlock3p.checked,
+    });
+    renderScriptReadResult(data);
+  } catch (err) {
+    renderScriptReadResult({
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    els.scriptReadBtn.disabled = false;
+  }
+});
+
+els.scriptWriteBtn.addEventListener('click', async () => {
+  const url = els.scriptUrl.value.trim();
+  const setCookie = els.scriptCookie.value.trim();
+  if (!url || !setCookie) {
+    renderStoreResult(
+      {
+        ok: false, action: 'rejected',
+        reason: !url ? '请先填写页面 URL' : '请先填写 document.cookie 赋值串',
+        notices: [],
+      },
+      els.scriptWriteResult,
+    );
+    return;
+  }
+  els.scriptWriteBtn.disabled = true;
+  try {
+    const data = await postJSON('/api/script/write', {
+      url,
+      setCookie,
+      topUrl: els.scriptTopUrl.value.trim(),
+      blockThirdParty: els.scriptBlock3p.checked,
+    });
+    renderStoreResult(data, els.scriptWriteResult);
+  } catch (err) {
+    renderStoreResult(
+      {
+        ok: false, action: 'rejected',
+        reason: err instanceof Error ? err.message : String(err),
+        notices: [],
+      },
+      els.scriptWriteResult,
+    );
+  } finally {
+    els.scriptWriteBtn.disabled = false;
+  }
+});
+
+/* 回车快捷提交：脚本面板 */
+els.scriptUrl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.scriptReadBtn.click();
+});
+els.scriptTopUrl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.scriptReadBtn.click();
+});
+els.scriptCookie.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.scriptWriteBtn.click();
+});
+
 addCapDomainRow();
 
 els.fillDemo.addEventListener('click', () => {
@@ -567,6 +740,9 @@ els.fillDemo.addEventListener('click', () => {
   els.sendTopUrl.value = 'https://embed.example.net/page';
   els.sendMethod.value = 'GET';
   els.sendTopnav.checked = true;
+  els.scriptUrl.value = 'https://shop.example.com/admin/dashboard';
+  els.scriptTopUrl.value = 'https://embed.example.net/page';
+  els.scriptCookie.value = 'uiTheme=dark; Path=/; Max-Age=3600; Secure';
 });
 
 /* 回车快捷提交 */

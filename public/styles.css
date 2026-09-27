@@ -381,6 +381,12 @@ select:focus {
 /* ---------- 容量压力面板 ---------- */
 .capacity-card { margin-bottom: 20px; }
 .capacity-card .jar-head h2 { margin: 0; font-size: 16px; }
+
+/* ---------- document.cookie 脚本演算面板 ---------- */
+.script-card { margin-bottom: 20px; }
+.script-card .jar-count code { font-size: 11.5px; color: var(--primary); }
+.script-actions { margin-bottom: 4px; }
+.script-write-field { margin-top: 14px; }
 .cap-global { margin-bottom: 12px; }
 .cap-domains-head {
   display: flex;

@@ -11,6 +11,13 @@
  *   POST /api/send               { url, topUrl?, method?, topLevelNav?, blockThirdParty? } 演算请求 Cookie 头；
  *                                blockThirdParty=true 时 topUrl 必填，跨站请求排除普通 Cookie
  *                                （分区键匹配的 Partitioned 项仍可发送）
+ *   POST /api/script/read        { url, topUrl?, blockThirdParty? } 演算页面脚本读取 document.cookie：
+ *                                按既有 过期/分区/第三方屏蔽/Domain/Path/Secure 筛选，再排除 HttpOnly；
+ *                                不应用 SameSite，不刷新最近访问时间，沿用请求头排序并逐项说明原因
+ *   POST /api/script/write       { url, setCookie, topUrl?, blockThirdParty? } 演算 document.cookie 赋值：
+ *                                复用既有解析/分区身份/容量逻辑；拒绝带 HttpOnly 的赋值，
+ *                                以及对同身份未过期 HttpOnly 项的覆盖或 Max-Age 删除
+ *                                （拒绝时罐内容、时间戳、容量不变；网络接口 /api/store 不受此限）
  *   POST /api/capacity           { globalLimit?, domainLimits? } 设置全局/每可注册域容量并立即执行淘汰
  *   POST /api/reset              清空内存罐（容量设置保留）
  *
@@ -104,6 +111,63 @@ app.post('/api/send', (req, res) => {
   });
   // 发送成功的条目会刷新最近访问时间，故把最新罐内容与用量一并返回
   res.json({ ...result, capacity: jar.capacity(), cookies: jar.list() });
+});
+
+interface ScriptReadBody {
+  url?: unknown;
+  topUrl?: unknown;
+  blockThirdParty?: unknown;
+}
+
+app.post('/api/script/read', (req, res) => {
+  const { url, topUrl, blockThirdParty } = (req.body ?? {}) as ScriptReadBody;
+  if (typeof url !== 'string' || url.trim() === '') {
+    res.status(400).json({ ok: false, error: '缺少页面 URL（字段 url）' });
+    return;
+  }
+  if (topUrl !== undefined && typeof topUrl !== 'string') {
+    res.status(400).json({ ok: false, error: '顶层页面 URL（字段 topUrl）必须是字符串' });
+    return;
+  }
+  if (blockThirdParty !== undefined && typeof blockThirdParty !== 'boolean') {
+    res.status(400).json({ ok: false, error: '屏蔽第三方 Cookie 开关（字段 blockThirdParty）必须是布尔值' });
+    return;
+  }
+  // 纯只读：不刷新最近访问时间、不改动罐内容，故不回写 cookies（仍附 capacity 供界面展示用量）
+  const result = jar.readDocumentCookie(url.trim(), {
+    topUrl: typeof topUrl === 'string' && topUrl.trim() !== '' ? topUrl.trim() : undefined,
+    blockThirdParty: blockThirdParty === true,
+  });
+  res.json({ ...result, capacity: jar.capacity() });
+});
+
+app.post('/api/script/write', (req, res) => {
+  const { url, setCookie, topUrl, blockThirdParty } = (req.body ?? {}) as StoreBody;
+  if (typeof url !== 'string' || url.trim() === '') {
+    res.status(400).json({ ok: false, error: '缺少页面 URL（字段 url）' });
+    return;
+  }
+  if (typeof setCookie !== 'string' || setCookie.trim() === '') {
+    res.status(400).json({ ok: false, error: '缺少 document.cookie 赋值串（字段 setCookie），一次只能提交一条' });
+    return;
+  }
+  if (topUrl !== undefined && typeof topUrl !== 'string') {
+    res.status(400).json({ ok: false, error: '顶层页面 URL（字段 topUrl）必须是字符串' });
+    return;
+  }
+  if (blockThirdParty !== undefined && typeof blockThirdParty !== 'boolean') {
+    res.status(400).json({ ok: false, error: '屏蔽第三方 Cookie 开关（字段 blockThirdParty）必须是布尔值' });
+    return;
+  }
+  const topUrlTrimmed = typeof topUrl === 'string' ? topUrl.trim() : '';
+  // fromScript=true：复用既有解析 / 分区身份 / 容量逻辑，追加 document.cookie 的 HttpOnly 保护
+  const result = jar.store(
+    url.trim(),
+    setCookie,
+    topUrlTrimmed === '' ? undefined : topUrlTrimmed,
+    { blockThirdParty: blockThirdParty === true, fromScript: true },
+  );
+  res.json({ ...result, capacity: jar.capacity() });
 });
 
 interface CapacityBody {
