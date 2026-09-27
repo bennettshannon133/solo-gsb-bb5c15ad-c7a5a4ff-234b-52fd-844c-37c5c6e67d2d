@@ -49,6 +49,25 @@
  *     跨站请求排除普通 Cookie（被排除条目不刷新最近访问时间），
  *     分区键匹配的 Partitioned 项不受此限，仍可发送；
  *   - 排序：Path 长度降序；相同长度按首次创建顺序（creation index）升序。
+ *
+ *  document.cookie 演算（页面 JS 读取 / 写入，区别于网络 Set-Cookie / Cookie 头）：
+ *  读取（readScript，页面 URL + 顶层页面 URL + 第三方屏蔽开关）：
+ *   - 依次套用与请求头相同的既有筛选：过期、Partitioned 分区键、屏蔽第三方、
+ *     Domain（host-only / Domain）、Path、Secure；
+ *   - 之后再排除 HttpOnly 项（JS 不可见），逐项说明排除原因；
+ *   - 不应用 SameSite 站点演算（document.cookie 不检查 SameSite）；
+ *   - 读取不产生网络发送，任何条目都不刷新最近访问时间（lastAccessedAt）；
+ *   - 可见项沿用请求头排序（Path 长度降序、创建序号升序），以 "; " 拼接成
+ *     document.cookie 读取字符串。
+ *  写入（writeScript，即 document.cookie = "..."）：
+ *   - 复用网络写入的全部解析、Domain/Path/Secure、分区身份、第三方屏蔽与容量逻辑；
+ *   - 赋值串带 HttpOnly 属性时直接拒绝（JS 无法设置 HttpOnly）；
+ *   - 同身份（name, domain, path[, 分区键]）已存在未过期 HttpOnly 项时，
+ *     拒绝覆盖、也拒绝 Max-Age<=0 删除（真实浏览器中 JS 对其静默无效）；
+ *   - 任何拒绝都不改动罐内容、不更新任何时间戳、不触发容量淘汰；
+ *   - 已过期的 HttpOnly 项不再受保护（过期清理语义，等同可覆盖/删除）。
+ *  网络接口（store/send）对 HttpOnly 不做上述限制：仍可写入、覆盖、删除，
+ *  发送时仍照常带上 HttpOnly 项。
  */
 import { getDomain } from 'tldts';
 
@@ -271,6 +290,12 @@ export interface StoreOptions {
   blockThirdParty?: boolean;
   /** 注入当前时间戳（测试用），缺省 Date.now() */
   now?: number;
+  /**
+   * 写入来源：'network'（默认，响应 Set-Cookie）或 'script'（document.cookie 赋值）。
+   * script 时额外拒绝 HttpOnly 赋值，以及对未过期 HttpOnly 同身份项的覆盖/删除，
+   * 拒绝不改动罐内容、时间戳与容量。
+   */
+  source?: CookieSource;
 }
 
 /** 发送演算的附加上下文（SameSite 判定所需） */
@@ -315,6 +340,74 @@ export interface SendResult {
   cookieHeader: string;
   sent: RequestItem[];
   excluded: RequestItem[];
+}
+
+/** 写入来源：network = 响应 Set-Cookie；script = 页面执行 document.cookie = ... */
+export type CookieSource = 'network' | 'script';
+
+/** document.cookie 读取演算中的单条结论（不携带 SameSite：读取不应用它） */
+export interface ScriptCookieItem {
+  index: number;
+  cookie: string;
+  name: string;
+  value: string;
+  domain: string;
+  hostOnly: boolean;
+  path: string;
+  secure: boolean;
+  httpOnly: boolean;
+  /** 是否独立分区 cookie（CHIPS） */
+  partitioned: boolean;
+  /** 该条目的分区键；未分区为 null */
+  partitionKey: string | null;
+  verdict: ItemVerdict;
+  /** 可见：命中的匹配点；隐藏（排除）：排除原因（含 HttpOnly 对 JS 不可见） */
+  detail: string;
+  expired: boolean;
+}
+
+export interface ScriptReadOptions {
+  /** 顶层页面 URL（决定 same-site 与请求分区键）；屏蔽第三方时必填且须有效 */
+  topUrl?: string;
+  /**
+   * 屏蔽第三方 Cookie（默认 false）：开启时必须提供有效顶层页面 URL，
+   * 跨站页面的读取排除普通 Cookie（分区键匹配的 Partitioned 项不受此限）
+   */
+  blockThirdParty?: boolean;
+}
+
+export interface ScriptReadResult {
+  ok: boolean;
+  error?: string;
+  /** 页面 URL（执行 document.cookie 的页面） */
+  pageUrl: string;
+  host: string;
+  path: string;
+  secureRequest: boolean;
+  /** 实际采用的顶层页面 URL（缺省时回显页面 URL） */
+  topUrl: string;
+  /** 页面站 / 顶层站（scheme + 可注册域；IP、localhost 按完整主机） */
+  requestSite: string;
+  topSite: string;
+  sameSiteContext: boolean;
+  blockThirdParty: boolean;
+  /** 请求分区键（由顶层页面 URL 计算） */
+  partitionKey: string;
+  /** document.cookie 读取字符串（已排除 HttpOnly 等不可见项；不应用 SameSite） */
+  cookieString: string;
+  visible: ScriptCookieItem[];
+  hidden: ScriptCookieItem[];
+}
+
+/** document.cookie 写入演算的附加选项（复用 StoreOptions 的语义） */
+export interface ScriptStoreOptions {
+  /**
+   * 屏蔽第三方 Cookie（默认 false）：开启时必须提供有效顶层页面 URL（topUrl），
+   * 跨站页面拒绝写入/删除普通 Cookie（Partitioned 分区项不受此限）
+   */
+  blockThirdParty?: boolean;
+  /** 注入当前时间戳（测试用），缺省 Date.now() */
+  now?: number;
 }
 
 /** 年份过大会让 Date 抛异常，这里钳制到一个安全的绝对上限（约公元 275760 年） */
@@ -594,6 +687,25 @@ export function pathMatch(requestPath: string, cookiePath: string): boolean {
   return requestPath.charAt(cookiePath.length) === '/';
 }
 
+/**
+ * 基础筛选上下文：网络请求头（send）与页面 document.cookie 读取（readScript）共用。
+ * mode 只影响逐项原因的措辞（发送 vs 对 JS 可见）。
+ */
+interface MatchContext {
+  host: string;
+  protocol: string;
+  path: string;
+  secureRequest: boolean;
+  /** 实际采用的顶层页面 URL（缺省时回显请求/页面 URL） */
+  topUrl: string;
+  /** 请求/读取分区键（顶层站点） */
+  partitionKey: string;
+  sameSiteContext: boolean;
+  siteCompare: string;
+  blockThirdParty: boolean;
+  mode: CookieSource;
+}
+
 /** 内存 Cookie 罐 */
 export class CookieJar {
   private cookies: StoredCookie[] = [];
@@ -610,12 +722,20 @@ export class CookieJar {
    * 此时 topUrl 必填且须为有效 http(s) 地址：跨站响应的普通 cookie 拒绝写入/删除
    * （不改动罐、不触发容量淘汰），Partitioned 分区项仍按既有规则处理。
    * 返回动作（入罐 / 更新 / 删除 / 拒绝）及原因。
+   *
+   * options.source === 'script' 时按页面执行 document.cookie = "..." 演算：
+   * 除上述规则外，赋值串带 HttpOnly 直接拒绝；同身份已存在未过期 HttpOnly 项时
+   * 拒绝覆盖 / Max-Age<=0 删除；任何拒绝都不改动罐、时间戳与容量。
+   * 默认 'network'（HTTP 响应 Set-Cookie），对 HttpOnly 不做这些限制。
    */
   store(responseUrl: string, setCookieHeader: string, topUrl?: string, options: StoreOptions = {}): StoreResult {
     const now = options.now ?? Date.now();
+    const fromScript = options.source === 'script';
+    // 报错文案随来源切换：网络写入称「响应 URL/响应站」，脚本写入称「页面 URL/页面站」
+    const origin = fromScript ? '页面' : '响应';
     const urlInfo = hostFromUrl(responseUrl);
     if (!urlInfo) {
-      return this.result(false, 'rejected', `响应 URL 非法或非 http(s)：${responseUrl}`, []);
+      return this.result(false, 'rejected', `${origin} URL 非法或非 http(s)：${responseUrl}`, []);
     }
 
     let parsed: ParsedSetCookie;
@@ -623,7 +743,20 @@ export class CookieJar {
       parsed = parseSetCookie(setCookieHeader);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      return this.result(false, 'rejected', `Set-Cookie 解析失败：${message}`, []);
+      const what = fromScript ? 'document.cookie 赋值串' : 'Set-Cookie';
+      return this.result(false, 'rejected', `${what}解析失败：${message}`, []);
+    }
+
+    // ---- 脚本写入（document.cookie = ...）专属限制 ----
+    // 1) JS 无法设置 HttpOnly：赋值串带该属性直接拒绝，罐内容 / 时间戳 / 容量均不变。
+    if (fromScript && parsed.httpOnly) {
+      return this.result(
+        false,
+        'rejected',
+        'document.cookie 是页面脚本接口，不能设置 HttpOnly cookie（HttpOnly 只能由网络 Set-Cookie 携带）；' +
+          '本次赋值被拒绝，罐内容、时间戳与容量均未改动（网络 /api/store 接口仍可写入 HttpOnly 项）',
+        [],
+      );
     }
 
     const { host } = urlInfo;
@@ -653,7 +786,7 @@ export class CookieJar {
         return this.result(
           false,
           'rejected',
-          `已开启屏蔽第三方 Cookie：跨站响应（响应站 ${responseSite} ≠ 顶层站 ${topSite}）` +
+          `已开启屏蔽第三方 Cookie：跨站${origin}（${origin}站 ${responseSite} ≠ 顶层站 ${topSite}）` +
             `拒绝${op}普通 Cookie（罐内容未改动，不触发容量淘汰）；` +
             `带 Partitioned 的分区 cookie 不受此限，仍按 Secure 与分区键规则处理`,
           notices,
@@ -680,7 +813,7 @@ export class CookieJar {
           return this.result(
             false,
             'rejected',
-            `响应主机 ${host} 是 IP 地址，Domain=${domain} 与其不一致；IP 不允许域/子域匹配，拒绝入罐`,
+            `${origin}主机 ${host} 是 IP 地址，Domain=${domain} 与其不一致；IP 不允许域/子域匹配，拒绝入罐`,
             notices,
             parsed,
           );
@@ -696,7 +829,7 @@ export class CookieJar {
         return this.result(
           false,
           'rejected',
-          `Domain=${domain} 不匹配响应主机 ${host}（既不是主机本身，也不是其上级域），拒绝入罐`,
+          `Domain=${domain} 不匹配${origin}主机 ${host}（既不是主机本身，也不是其上级域），拒绝入罐`,
           notices,
           parsed,
         );
@@ -710,15 +843,15 @@ export class CookieJar {
       if (parsed.path !== undefined) {
         notices.push(`Path="${parsed.path}" 不是绝对路径，忽略并使用默认 Path=${cookiePath}`);
       } else {
-        notices.push(`Path 属性缺省，取默认路径（响应 URL 最后一个斜杠前的目录）：${cookiePath}`);
+        notices.push(`Path 属性缺省，取默认路径（${origin} URL 最后一个斜杠前的目录）：${cookiePath}`);
       }
     } else {
       cookiePath = parsed.path;
     }
 
-    // ---- 3. Secure 提示：明文 http 响应写入 Secure ----
+    // ---- 3. Secure 提示：明文 http 页面/响应写入 Secure ----
     if (parsed.secure && urlInfo.protocol === 'http:') {
-      notices.push('响应来自明文 http:// 却带 Secure 属性：真实浏览器通常会拒绝该 cookie；本罐仍记录，但它永远不会经 http 请求发送');
+      notices.push(`当前页面来自明文 http:// 却带 Secure 属性：真实浏览器通常会拒绝该 cookie；本罐仍记录，但它永远不会经 http 请求发送`);
     }
     if (parsed.maxAgeInvalid) {
       notices.push('Max-Age 值非法（非整数），已忽略该属性，按会话 cookie 处理（Expires 同样不参与本演算）');
@@ -780,6 +913,30 @@ export class CookieJar {
     }
 
     const existing = this.findCookie(parsed.name, domain, cookiePath, partitionKey);
+
+    // ---- 3.8 脚本写入的 HttpOnly 保护 ----
+    // document.cookie 无法触碰未过期的 HttpOnly 项：既不能覆盖，也不能用 Max-Age<=0 删除。
+    // 已过期的 HttpOnly 项不再保护（过期项本就应被清理）。拒绝时罐、时间戳、容量均不变。
+    if (fromScript && existing && existing.httpOnly) {
+      const existingExpired =
+        existing.expiresAt !== undefined && existing.expiresAt <= now;
+      if (!existingExpired) {
+        const partitionText = partitionKey === null ? '未分区' : `分区 ${partitionKey}`;
+        const op = parsed.maxAge !== undefined && parsed.maxAge <= 0
+          ? `用 Max-Age=${parsed.maxAge}（≤0）删除`
+          : '覆盖';
+        return this.result(
+          false,
+          'rejected',
+          `document.cookie 不能${op}未过期的 HttpOnly cookie：罐中已存在同身份项 ` +
+            `${parsed.name}（#${existing.creationIndex}，domain=${domain}，path=${cookiePath}，${partitionText}）` +
+            `且 HttpOnly、尚未过期；真实浏览器中该赋值静默无效。本次操作被拒绝，` +
+            `罐内容、时间戳（创建/更新/最近访问）与容量均未改动（网络 /api/store 接口仍可覆盖/删除它）`,
+          notices,
+          parsed,
+        );
+      }
+    }
 
     // ---- 4. Max-Age <= 0：删除同名 (name, domain, path[, 分区]) 项 ----
     if (parsed.maxAge !== undefined && parsed.maxAge <= 0) {
@@ -947,6 +1104,18 @@ export class CookieJar {
 
     const sent: RequestItem[] = [];
     const excluded: RequestItem[] = [];
+    const matchCtx: MatchContext = {
+      host,
+      protocol,
+      path,
+      secureRequest,
+      topUrl,
+      partitionKey,
+      sameSiteContext,
+      siteCompare,
+      blockThirdParty,
+      mode: 'network',
+    };
 
     for (const c of this.cookies) {
       const expired = c.expiresAt !== undefined && c.expiresAt <= now;
@@ -969,49 +1138,15 @@ export class CookieJar {
         expired,
       };
 
-      // 按 RFC 6265 的顺序逐项检查
-      if (expired) {
-        base.detail = `已过期（${formatTime(c.expiresAt as number)}），不发送`;
-        excluded.push(base);
-        continue;
-      }
-      // 分区隔离（CHIPS）：分区项只在键相同的请求分区发送；键不同直接排除
-      if (c.partitioned && c.partitionKey !== partitionKey) {
-        base.detail =
-          `Partitioned 分区 cookie 仅在其分区内发送：条目分区键 ${c.partitionKey} ≠ 请求分区键 ${partitionKey}` +
-          `（由顶层页面 ${topUrl} 计算），跨分区不发送`;
-        excluded.push(base);
-        continue;
-      }
-      // 屏蔽第三方 Cookie（可选模式）：跨站请求排除普通 cookie；
-      // 分区键匹配的 Partitioned 项豁免，继续走后续既有检查。
-      // 被排除的条目不刷新最近访问时间（只有发送成功才刷新）。
-      if (blockThirdParty && !sameSiteContext && !c.partitioned) {
-        base.detail =
-          `已开启屏蔽第三方 Cookie：跨站请求（${siteCompare}）排除普通 Cookie，不发送；` +
-          `分区键匹配的 Partitioned 项不受此限`;
-        excluded.push(base);
-        continue;
-      }
-      if (!domainMatch(host, c)) {
-        base.detail = c.hostOnly
-          ? `host-only cookie 仅匹配原主机 ${c.domain}，请求主机 ${host} 不相等`
-          : `Domain cookie 匹配域 ${c.domain} 及其子域，请求主机 ${host} 不属于该范围`;
-        excluded.push(base);
-        continue;
-      }
-      if (!pathMatch(path, c.path)) {
-        base.detail = `Path 不匹配：cookie-path="${c.path}"，request-path="${path}"（需相等，或以其开头且边界为 "/"）`;
-        excluded.push(base);
-        continue;
-      }
-      if (c.secure && !secureRequest) {
-        base.detail = `Secure cookie 仅经 https 发送，请求为明文 ${protocol}//`;
+      // 基础筛选（与 document.cookie 读取共用；不含 SameSite）
+      const basicReason = this.basicExclusionReason(c, matchCtx, expired);
+      if (basicReason !== null) {
+        base.detail = basicReason;
         excluded.push(base);
         continue;
       }
 
-      // ---- SameSite 站点演算 ----
+      // ---- SameSite 站点演算（仅网络请求头应用；document.cookie 读取不应用） ----
       const ssVerdict = this.sameSiteVerdict(c, label, {
         sameSiteContext,
         siteCompare,
@@ -1074,6 +1209,159 @@ export class CookieJar {
     };
   }
 
+  /**
+   * 演算页面 JS 读取 document.cookie。
+   *
+   * 与网络请求头（send）的差异：
+   *  - 相同：过期、Partitioned 分区键、屏蔽第三方 Cookie、Domain、Path、Secure 六类基础筛选；
+   *  - 不同：**不应用 SameSite**（document.cookie 读取不做 SameSite 站点演算）；
+   *          **HttpOnly 项对 JS 不可见**（在基础筛选通过后再排除）；
+   *          读取不发送任何内容，**不刷新任何条目的最近访问时间**。
+   * 可见项沿用请求头排序（Path 长度降序、创建序号升序）并以 "; " 拼成读取字符串。
+   */
+  readScript(pageUrl: string, options: ScriptReadOptions = {}, now: number = Date.now()): ScriptReadResult {
+    const urlInfo = hostFromUrl(pageUrl);
+    if (!urlInfo) {
+      return this.scriptReadError(`页面 URL 非法或非 http(s)：${pageUrl}`, pageUrl);
+    }
+
+    const blockThirdParty = options.blockThirdParty === true;
+
+    const topRaw = typeof options.topUrl === 'string' ? options.topUrl.trim() : '';
+    if (blockThirdParty && topRaw === '') {
+      return this.scriptReadError(
+        '已开启屏蔽第三方 Cookie：必须提供有效的顶层页面 URL（http(s)）作为跨站判定基准，当前未填写',
+        pageUrl,
+        true,
+      );
+    }
+    let topInfo = urlInfo;
+    let topUrl = pageUrl;
+    if (topRaw !== '') {
+      const parsedTop = hostFromUrl(topRaw);
+      if (!parsedTop) {
+        return this.scriptReadError(`顶层页面 URL 非法或非 http(s)：${topRaw}`, pageUrl, blockThirdParty);
+      }
+      topInfo = parsedTop;
+      topUrl = topRaw;
+    }
+
+    const { host, protocol, path } = urlInfo;
+    const secureRequest = protocol === 'https:';
+
+    const requestSite = siteOf(host, protocol);
+    const topSite = siteOf(topInfo.host, topInfo.protocol);
+    const sameSiteContext = requestSite === topSite;
+    const partitionKey = topSite;
+    const siteCompare = `页面站 ${requestSite} ${sameSiteContext ? '=' : '≠'} 顶层站 ${topSite}`;
+
+    const visible: ScriptCookieItem[] = [];
+    const hidden: ScriptCookieItem[] = [];
+    const matchCtx: MatchContext = {
+      host,
+      protocol,
+      path,
+      secureRequest,
+      topUrl,
+      partitionKey,
+      sameSiteContext,
+      siteCompare,
+      blockThirdParty,
+      mode: 'script',
+    };
+
+    for (const c of this.cookies) {
+      const expired = c.expiresAt !== undefined && c.expiresAt <= now;
+      const item: ScriptCookieItem = {
+        index: c.creationIndex,
+        cookie: `${c.name}=${c.value}`,
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        hostOnly: c.hostOnly,
+        path: c.path,
+        secure: c.secure,
+        httpOnly: c.httpOnly,
+        partitioned: c.partitioned,
+        partitionKey: c.partitionKey,
+        verdict: 'exclude',
+        detail: '',
+        expired,
+      };
+
+      // 1) 与请求头相同的基础筛选（不应用 SameSite）
+      const basicReason = this.basicExclusionReason(c, matchCtx, expired);
+      if (basicReason !== null) {
+        item.detail = basicReason;
+        hidden.push(item);
+        continue;
+      }
+      // 2) HttpOnly 对页面脚本不可见（document.cookie 特有的最后一道排除）
+      if (c.httpOnly) {
+        item.detail =
+          `HttpOnly cookie 对页面脚本不可见：document.cookie 读不到该项（#${c.creationIndex}，` +
+          `domain=${c.domain}，path=${c.path}）；它仍可由网络请求头 /api/send 发送`;
+        hidden.push(item);
+        continue;
+      }
+
+      item.verdict = 'send';
+      const hostWay = c.hostOnly ? '主机精确相等' : `主机 ${host} 命中域 ${c.domain}`;
+      const partitionWay = c.partitioned ? `；分区键 ${partitionKey} 匹配（Partitioned）` : '';
+      const thirdPartyWay =
+        blockThirdParty && !sameSiteContext && c.partitioned
+          ? '；屏蔽第三方 Cookie 已开启：跨站普通 Cookie 被排除，分区键匹配的 Partitioned 项豁免'
+          : '';
+      item.detail =
+        `对 JS 可见：${hostWay}；页面路径 "${path}" 命中 cookie-path "${c.path}"` +
+        (c.secure ? '；https 满足 Secure' : '') +
+        partitionWay +
+        thirdPartyWay +
+        '；document.cookie 不检查 SameSite；读取不刷新最近访问时间';
+      // 注意：读取不刷新 c.lastAccessedAt（只有网络发送成功才刷新）
+      visible.push(item);
+    }
+
+    // 可见项沿用请求头排序：Path 长度降序；相等时首次创建顺序升序
+    visible.sort((a, b) => {
+      if (b.path.length !== a.path.length) return b.path.length - a.path.length;
+      return a.index - b.index;
+    });
+    // 隐藏列表保持创建顺序，便于对照
+    hidden.sort((a, b) => a.index - b.index);
+
+    return {
+      ok: true,
+      pageUrl,
+      host,
+      path,
+      secureRequest,
+      topUrl,
+      requestSite,
+      topSite,
+      sameSiteContext,
+      blockThirdParty,
+      partitionKey,
+      cookieString: visible.map((i) => i.cookie).join('; '),
+      visible,
+      hidden,
+    };
+  }
+
+  /**
+   * 演算页面 JS 写入 document.cookie（document.cookie = "name=value; ..."）。
+   * 直接复用 store() 的解析、Domain/Path/Secure、分区身份、第三方屏蔽与容量逻辑，
+   * 仅以 source='script' 打开 HttpOnly 专属限制（拒绝 HttpOnly 赋值、拒绝覆盖/删除
+   * 未过期的 HttpOnly 同身份项）；拒绝时罐内容、时间戳与容量不变。
+   */
+  writeScript(pageUrl: string, cookieAssignment: string, topUrl?: string, options: ScriptStoreOptions = {}): StoreResult {
+    return this.store(pageUrl, cookieAssignment, topUrl, {
+      blockThirdParty: options.blockThirdParty,
+      now: options.now,
+      source: 'script',
+    });
+  }
+
   /** 当前罐内容（会话/未过期状态如实展示，不过滤过期项） */
   list(now: number = Date.now()): CookieView[] {
     return this.views(now);
@@ -1130,6 +1418,74 @@ export class CookieJar {
         c.path === path &&
         c.partitionKey === partitionKey,
     );
+  }
+
+  /**
+   * 基础筛选（网络请求头与 document.cookie 读取共用）：按 RFC 6265 的顺序，
+   * 依次检查 过期 → Partitioned 分区键 → 屏蔽第三方 → Domain → Path → Secure。
+   * **不含 SameSite**：SameSite 仅网络请求头在调用方继续演算，document.cookie 不应用。
+   * **不含 HttpOnly**：HttpOnly 仅由 document.cookie 读取在调用方额外排除。
+   * 返回 null 表示通过；否则返回逐项排除原因。
+   * 该方法不修改任何状态（最近访问时间由调用方在真正发送时刷新）。
+   */
+  private basicExclusionReason(c: StoredCookie, ctx: MatchContext, expired: boolean): string | null {
+    const { host, protocol, path, secureRequest, topUrl, partitionKey, sameSiteContext, siteCompare, blockThirdParty, mode } = ctx;
+    // 措辞随场景切换：网络请求头称「请求主机/不发送」，document.cookie 称「页面主机/对 JS 不可见」
+    const requestWord = mode === 'script' ? '页面' : '请求';
+    const tail = mode === 'script' ? '，document.cookie 对其不可见' : '，不发送';
+
+    if (expired) {
+      return `已过期（${formatTime(c.expiresAt as number)}）${tail}`;
+    }
+    if (c.partitioned && c.partitionKey !== partitionKey) {
+      return (
+        `Partitioned 分区 cookie 仅在其分区内${mode === 'script' ? '可见' : '发送'}：` +
+        `条目分区键 ${c.partitionKey} ≠ ${requestWord}分区键 ${partitionKey}` +
+        `（由顶层页面 ${topUrl} 计算），跨分区${tail}`
+      );
+    }
+    // 屏蔽第三方 Cookie：跨站排除普通 cookie；分区键匹配的 Partitioned 项豁免。
+    if (blockThirdParty && !sameSiteContext && !c.partitioned) {
+      return (
+        `已开启屏蔽第三方 Cookie：跨站${requestWord}（${siteCompare}）排除普通 Cookie${tail}；` +
+        `分区键匹配的 Partitioned 项不受此限`
+      );
+    }
+    if (!domainMatch(host, c)) {
+      return c.hostOnly
+        ? `host-only cookie 仅匹配原主机 ${c.domain}，${requestWord}主机 ${host} 不相等`
+        : `Domain cookie 匹配域 ${c.domain} 及其子域，${requestWord}主机 ${host} 不属于该范围`;
+    }
+    if (!pathMatch(path, c.path)) {
+      const pathName = mode === 'script' ? '页面路径' : 'request-path';
+      return `Path 不匹配：cookie-path="${c.path}"，${pathName}="${path}"（需相等，或以其开头且边界为 "/"）`;
+    }
+    if (c.secure && !secureRequest) {
+      return mode === 'script'
+        ? `Secure cookie 仅在 https 页面的 document.cookie 中可见，当前页面为明文 ${protocol}//`
+        : `Secure cookie 仅经 https 发送，请求为明文 ${protocol}//`;
+    }
+    return null;
+  }
+
+  private scriptReadError(error: string, pageUrl: string, blockThirdParty: boolean = false): ScriptReadResult {
+    return {
+      ok: false,
+      error,
+      pageUrl,
+      host: '',
+      path: '',
+      secureRequest: false,
+      topUrl: '',
+      requestSite: '',
+      topSite: '',
+      sameSiteContext: false,
+      blockThirdParty,
+      partitionKey: '',
+      cookieString: '',
+      visible: [],
+      hidden: [],
+    };
   }
 
   /**

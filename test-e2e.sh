@@ -727,6 +727,195 @@ R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/send" -H 'Content-
 [ "$R" = "400" ] && { echo "✅ /api/send 非布尔 blockThirdParty 拒绝（400）"; PASS=$((PASS+1)); } || { echo "❌ /api/send 应 400，实际 $R"; FAIL=$((FAIL+1)); }
 
 echo
+echo "------- document.cookie（页面脚本）写入演算 /api/script/write -------"
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+# 网络预置：普通项 a、未过期 HttpOnly 项 sid、Secure 项 sec
+post /api/store '{"url":"https://dc.example.com/","setCookie":"a=1; Path=/; SameSite=Strict"}' >/dev/null
+post /api/store '{"url":"https://dc.example.com/","setCookie":"sid=secret; Path=/; HttpOnly"}' >/dev/null
+post /api/store '{"url":"https://dc.example.com/","setCookie":"sec=1; Path=/; Secure"}' >/dev/null
+
+echo "== D1. 脚本写入普通 cookie -> 复用入罐逻辑 =="
+R=$(post /api/script/write '{"url":"https://dc.example.com/","cookie":"js=1; Path=/; Priority=Low"}')
+check "入罐" '"action":"stored"' "$R"
+check "非 HttpOnly" '"httpOnly":false' "$R"
+
+echo "== D2. 赋值串带 HttpOnly -> 拒绝，罐不变 =="
+R=$(post /api/script/write '{"url":"https://dc.example.com/","cookie":"x=1; Path=/; HttpOnly"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（不能设置 HttpOnly）" "不能设置 HttpOnly" "$R"
+J=$(curl -s "$BASE/api/jar")
+check "罐中无 x" '"totalCount":4' "$J"
+
+echo "== D3. 覆盖未过期 HttpOnly 同身份项 -> 拒绝且值不变 =="
+R=$(post /api/script/write '{"url":"https://dc.example.com/","cookie":"sid=hacked; Path=/"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（不能覆盖 HttpOnly）" "不能覆盖" "$R"
+check "原因说明未过期" "尚未过期" "$R"
+J=$(curl -s "$BASE/api/jar")
+echo "$J" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+sid=[c for c in d['cookies'] if c['name']=='sid'][0]
+assert sid['value']=='secret' and sid['httpOnly'] is True, sid
+print('✅ sid 仍为 secret 且仍 HttpOnly')" && PASS=$((PASS+1)) || { echo "❌ HttpOnly 项被脚本改动"; FAIL=$((FAIL+1)); }
+
+echo "== D4. Max-Age=0 删除未过期 HttpOnly 项 -> 拒绝且仍在 =="
+R=$(post /api/script/write '{"url":"https://dc.example.com/","cookie":"sid=; Path=/; Max-Age=0"}')
+check "拒绝" '"action":"rejected"' "$R"
+check "拒绝原因（不能删除 HttpOnly）" "删除" "$R"
+J=$(curl -s "$BASE/api/jar")
+check "sid 仍在罐中" '"name":"sid"' "$J"
+
+echo "== D5. 网络 /api/store 仍可覆盖 HttpOnly 项（对比） =="
+R=$(post /api/store '{"url":"https://dc.example.com/","setCookie":"sid=renewed; Path=/; HttpOnly"}')
+check "网络更新成功" '"action":"updated"' "$R"
+check "值已更新" '"value":"renewed"' "$R"
+
+echo "== D6. 已过期 HttpOnly 项不再受脚本保护（可覆盖，且去掉 HttpOnly） =="
+post /api/store '{"url":"https://dc.example.com/","setCookie":"mort=1; Path=/; HttpOnly; Max-Age=1"}' >/dev/null
+sleep 1.3
+R=$(post /api/script/write '{"url":"https://dc.example.com/","cookie":"mort=2; Path=/"}')
+check "过期后可更新" '"action":"updated"' "$R"
+check "新值非 HttpOnly" '"value":"2","domain"' "$R"
+
+echo "== D7. 脚本删除普通（非 HttpOnly）项：允许 =="
+R=$(post /api/script/write '{"url":"https://dc.example.com/","cookie":"js=; Path=/; Max-Age=0"}')
+check "删除动作" '"action":"deleted"' "$R"
+
+echo "== D8. 拒绝时时间戳与容量均不变（全局容量下不触发淘汰） =="
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":2}' >/dev/null
+post /api/store '{"url":"https://dc.example.com/","setCookie":"hh=1; Path=/; HttpOnly"}' >/dev/null
+sleep 1.1
+post /api/store '{"url":"https://dc.example.com/","setCookie":"ll=1; Path=/; Priority=Low"}' >/dev/null
+SNAP1=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;d=json.load(sys.stdin);print(sorted((c['index'],c['name'],c['updatedAt'],c['lastAccessedAt']) for c in d['cookies']))")
+sleep 1.1
+R=$(post /api/script/write '{"url":"https://dc.example.com/","cookie":"hh=2; Path=/; Priority=High"}')
+check "拒绝" '"action":"rejected"' "$R"
+SNAP2=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;d=json.load(sys.stdin);print(sorted((c['index'],c['name'],c['updatedAt'],c['lastAccessedAt']) for c in d['cookies']))")
+[ "$SNAP1" = "$SNAP2" ] && { echo "✅ 拒绝后内容/时间戳快照一致（且容量淘汰未触发）"; PASS=$((PASS+1)); } || { echo "❌ 拒绝后状态被改动"; FAIL=$((FAIL+1)); }
+
+echo "== D9. 正常脚本写入仍复用容量淘汰逻辑 =="
+R=$(post /api/script/write '{"url":"https://dc.example.com/","cookie":"jj=1; Path=/; Priority=High"}')
+check "触发全局淘汰" '"scope":"global"' "$R"
+check "Low 项出局" '"cookie":"ll=1"' "$R"
+
+echo "== D10. 脚本写入同样受屏蔽第三方 Cookie 约束（跨站普通项拒绝，Partitioned 允许） =="
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+R=$(post /api/script/write '{"url":"https://tracker.vendor.com/p","cookie":"trk=1; Path=/","topUrl":"https://shop.example.com/","blockThirdParty":true}')
+check "拒绝" '"action":"rejected"' "$R"
+check "页面站措辞" "跨站页面" "$R"
+R=$(post /api/script/write '{"url":"https://widget.vendor.com/frame","cookie":"ch=1; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://shop.example.com/","blockThirdParty":true}')
+check "分区项允许" '"action":"stored"' "$R"
+check "分区键正确" '"partitionKey":"https://example.com"' "$R"
+
+echo "== D11. 脚本写入字段校验 =="
+R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/script/write" -H 'Content-Type: application/json' -d '{"url":"https://dc.example.com/"}')
+[ "$R" = "400" ] && { echo "✅ 缺 cookie 字段 400"; PASS=$((PASS+1)); } || { echo "❌ 应 400，实际 $R"; FAIL=$((FAIL+1)); }
+R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/script/write" -H 'Content-Type: application/json' -d '{"cookie":"a=1"}')
+[ "$R" = "400" ] && { echo "✅ 缺 url 字段 400"; PASS=$((PASS+1)); } || { echo "❌ 应 400，实际 $R"; FAIL=$((FAIL+1)); }
+
+echo
+echo "------- document.cookie（页面脚本）读取演算 /api/script/read -------"
+
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://dc.example.com/","setCookie":"a=1; Path=/; SameSite=Strict"}' >/dev/null
+post /api/store '{"url":"https://dc.example.com/","setCookie":"sid=secret; Path=/; HttpOnly"}' >/dev/null
+post /api/store '{"url":"https://dc.example.com/","setCookie":"sec=1; Path=/; Secure"}' >/dev/null
+
+echo "== R1. https 同站：普通项与 Secure 项可见，HttpOnly 隐藏，无 SameSite 拦截 =="
+R=$(post /api/script/read '{"url":"https://dc.example.com/"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieString'])")
+check "读取字符串含 a" "a=1" "$HDR"
+check "读取字符串含 sec" "sec=1" "$HDR"
+if [[ "$HDR" != *"sid=secret"* ]]; then echo "✅ HttpOnly 不在 document.cookie"; PASS=$((PASS+1));
+else echo "❌ HttpOnly 泄漏到 document.cookie"; FAIL=$((FAIL+1)); fi
+check "HttpOnly 隐藏原因" "对页面脚本不可见" "$R"
+
+echo "== R2. 跨站页面：SameSite=Strict 仍可见（document.cookie 不应用 SameSite） =="
+R=$(post /api/script/read '{"url":"https://dc.example.com/","topUrl":"https://other.org/"}')
+check "跨站标记" '"sameSiteContext":false' "$R"
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieString'])")
+check "Strict 项跨站仍可见" "a=1" "$HDR"
+# 排除明细中不应出现任何 SameSite 原因
+if [[ "$R" != *"SameSite="*"不发送"* ]] && ! echo "$R" | grep -q "仅同站请求发送"; then
+  echo "✅ 排除明细不含 SameSite 拦截原因"; PASS=$((PASS+1));
+else echo "❌ document.cookie 读取错误地应用了 SameSite"; FAIL=$((FAIL+1)); fi
+
+echo "== R3. 读取不刷新最近访问时间 =="
+B1=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print([c['lastAccessedAt'] for c in json.load(sys.stdin)['cookies'] if c['name']=='a'][0])")
+sleep 1.1
+post /api/script/read '{"url":"https://dc.example.com/"}' >/dev/null
+B2=$(curl -s "$BASE/api/jar" | python3 -c "import sys,json;print([c['lastAccessedAt'] for c in json.load(sys.stdin)['cookies'] if c['name']=='a'][0])")
+[ "$B1" = "$B2" ] && { echo "✅ 读取前后最近访问时间不变"; PASS=$((PASS+1)); } || { echo "❌ 读取刷新了最近访问时间"; FAIL=$((FAIL+1)); }
+
+echo "== R4. 可见项沿用请求头排序（Path 长度降序、创建序号升序） =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://sr.test/a/b/c","setCookie":"long=1; Path=/a/b"}' >/dev/null
+post /api/store '{"url":"https://sr.test/","setCookie":"root=2; Path=/"}' >/dev/null
+post /api/store '{"url":"https://sr.test/","setCookie":"short=3; Path=/a"}' >/dev/null
+R=$(post /api/script/read '{"url":"https://sr.test/a/b/c/page"}')
+check "排序 long;short;root" "long=1; short=3; root=2" "$R"
+
+echo "== R5. 过期 / Path / Secure 基础筛选逐项给原因 =="
+post /api/store '{"url":"https://sr.test/","setCookie":"dead=1; Path=/; Max-Age=1"}' >/dev/null
+post /api/store '{"url":"https://sr.test/","setCookie":"ss=1; Path=/a/b; Secure"}' >/dev/null
+sleep 1.3
+R=$(post /api/script/read '{"url":"https://sr.test/home"}')
+check "过期隐藏" "已过期" "$R"
+check "Path 不匹配隐藏" "Path 不匹配" "$R"
+R=$(post /api/script/read '{"url":"http://sr.test/a/b/c/page"}')
+check "Secure 在 http 页面隐藏（JS 措辞）" "仅在 https 页面的 document.cookie 中可见" "$R"
+if [[ "$R" != *"仅经 https 发送"* ]]; then echo "✅ 脚本读取使用 JS 可见性措辞"; PASS=$((PASS+1));
+else echo "❌ 脚本读取误用了网络发送措辞"; FAIL=$((FAIL+1)); fi
+
+echo "== R6. 分区键过滤：仅键相同的 Partitioned 项可见 =="
+post /api/store '{"url":"https://w.vendor.com/frame","setCookie":"ch=a; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://pa.example/"}' >/dev/null
+post /api/store '{"url":"https://w.vendor.com/frame","setCookie":"ch=b; Path=/; Secure; SameSite=None; Partitioned","topUrl":"https://pb.example/"}' >/dev/null
+post /api/store '{"url":"https://w.vendor.com/frame","setCookie":"ch=u; Path=/; Secure; SameSite=None"}' >/dev/null
+R=$(post /api/script/read '{"url":"https://w.vendor.com/frame/x","topUrl":"https://pb.example/p"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieString'])")
+check "pb 分区项可见" "ch=b" "$HDR"
+check "普通项可见" "ch=u" "$HDR"
+if [[ "$HDR" != *"ch=a"* ]]; then echo "✅ pa 分区项跨分区隐藏"; PASS=$((PASS+1));
+else echo "❌ 跨分区项误可见"; FAIL=$((FAIL+1)); fi
+check "隐藏原因（分区键不同，JS 措辞）" "仅在其分区内可见" "$R"
+
+echo "== R7. 屏蔽第三方 Cookie：跨站普通项隐藏，分区匹配项豁免 =="
+R=$(post /api/script/read '{"url":"https://w.vendor.com/frame","topUrl":"https://pb.example/p","blockThirdParty":true}')
+check "开关回显" '"blockThirdParty":true' "$R"
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieString'])")
+check "分区匹配项仍可见" "ch=b" "$HDR"
+if [[ "$HDR" != *"ch=u"* ]]; then echo "✅ 跨站普通项被屏蔽隐藏"; PASS=$((PASS+1));
+else echo "❌ 跨站普通项未被屏蔽"; FAIL=$((FAIL+1)); fi
+check "隐藏原因（跨站页面措辞）" "跨站页面" "$R"
+
+echo "== R8. 读取报错场景 =="
+R=$(post /api/script/read '{"url":"https://dc.example.com/","blockThirdParty":true}')
+check "缺顶层 URL 报错" "必须提供有效的顶层页面 URL" "$R"
+R=$(post /api/script/read '{"url":"bad"}')
+check "非法页面 URL 报错" "页面 URL 非法" "$R"
+R=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/script/read" -H 'Content-Type: application/json' -d '{}')
+[ "$R" = "400" ] && { echo "✅ 缺 url 字段 400"; PASS=$((PASS+1)); } || { echo "❌ 应 400，实际 $R"; FAIL=$((FAIL+1)); }
+
+echo "== R9. 网络请求头仍发送 HttpOnly 项（与脚本读取对比） =="
+post /api/reset '{}' >/dev/null
+post /api/store '{"url":"https://dc.example.com/","setCookie":"sid=secret; Path=/; HttpOnly"}' >/dev/null
+R=$(post /api/send '{"url":"https://dc.example.com/"}')
+check "网络发送含 HttpOnly" "sid=secret" "$R"
+R=$(post /api/script/read '{"url":"https://dc.example.com/"}')
+HDR=$(echo "$R" | python3 -c "import sys,json;print(json.load(sys.stdin)['cookieString'])")
+if [[ "$HDR" != *"sid=secret"* ]]; then echo "✅ 同一 HttpOnly 项：网络发送但 document.cookie 不可见"; PASS=$((PASS+1));
+else echo "❌ HttpOnly 泄漏到脚本读取"; FAIL=$((FAIL+1)); fi
+
+post /api/reset '{}' >/dev/null
+post /api/capacity '{"globalLimit":null,"domainLimits":{}}' >/dev/null
+
+echo
 echo "================================"
 echo "通过 $PASS，失败 $FAIL"
 [ "$FAIL" -eq 0 ]

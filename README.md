@@ -21,6 +21,14 @@ Partitioned 分区项仍按既有 Secure 与分区键规则正常入罐；**跨�
 （被排除条目不刷新最近访问时间），分区键匹配的 Partitioned 项仍可发送；
 拒绝/排除结果逐项说明策略原因。
 
+还内置 **document.cookie 演算面板**（页面内 JavaScript 视角，对应
+`/api/script/read`、`/api/script/write`）：读取按既有 Domain、Path、Secure、过期、
+分区与第三方屏蔽规则筛选后**再排除 HttpOnly**，**不应用 SameSite**、**不刷新最近访问时间**，
+沿用请求头排序拼成读取字符串并逐项说明隐藏原因；写入复用网络入罐的解析、分区身份与容量逻辑，
+但**拒绝带 HttpOnly 的赋值**，也**拒绝覆盖或用 Max-Age 删除未过期的 HttpOnly 同身份项**
+（拒绝时罐内容、时间戳与容量均不变）。网络接口 `/api/store`、`/api/send` 不受这些限制，
+仍可写入、更新并发送 HttpOnly 项。
+
 技术栈：**TypeScript + Express + 原生 HTML/CSS/JS**（前端无框架、无构建），数据仅存内存；
 same-site 判定使用 [tldts](https://github.com/remusao/tldts)（内置公共后缀列表 PSL，含私有域段）。
 
@@ -83,9 +91,20 @@ docker compose up --build -d    # 改完代码后重新构建并启动
    - 📤 **发送项**：命中的主机 / Path / Secure / SameSite / 分区键匹配点
    - 🚫 **排除项**：过期、Domain 不匹配、Path 不匹配、Secure 受限、SameSite 拦截、
      **分区键不符（Partitioned）**、**第三方屏蔽（跨站普通 Cookie）**等逐项原因
-3. **🫙 当前 Cookie 罐**：右侧表格实时展示全部条目（域、作用域、Path、**分区键**、Secure、
-   Priority、有效期剩余、创建序号、**最近访问时间**）；点击 **重置** 清空内存罐。
-4. **🎚️ 容量压力模拟**（右栏顶部）：设置**全局容量**与**每个可注册域的容量**（按条目条数，
+3. **📜 document.cookie 演算（页面内 JavaScript）**：填「页面 URL」（执行
+   `document.cookie` 的页面）与「顶层页面 URL」（分区键与跨站判定基准，留空 = 与页面同站），
+   可勾选 **屏蔽第三方 Cookie**：
+   - 点击 **读取 document.cookie**：得到读取字符串（可一键复制）与
+     👁️ **可见项** / 🚫 **隐藏项**——按既有 Domain / Path / Secure / 过期 / 分区 /
+     第三方屏蔽规则筛选后**再排除 HttpOnly**，逐项给出隐藏原因；
+     **不应用 SameSite**，读取也**不刷新最近访问时间**；
+   - 填「写入赋值串」（等价于 `document.cookie = "..."`）点击 **执行 document.cookie 赋值**：
+     复用入罐规则（Domain / Path / Max-Age / 分区身份 / 容量淘汰），但**带 HttpOnly 的赋值
+     直接拒绝**；同身份已存在**未过期 HttpOnly 项**时，**覆盖与 Max-Age 删除都被拒绝**
+     （拒绝时罐内容、时间戳与容量不变）。网络接口 `/api/store`、`/api/send` 不受此限。
+4. **🫙 当前 Cookie 罐**：右侧表格实时展示全部条目（域、作用域、Path、**分区键**、Secure、
+   HttpOnly、Priority、有效期剩余、创建序号、**最近访问时间**）；点击 **重置** 清空内存罐。
+5. **🎚️ 容量压力模拟**（右栏顶部）：设置**全局容量**与**每个可注册域的容量**（按条目条数，
    留空 = 不限），点击 **应用容量设置** 立即按新上限执行一次淘汰；之后每次入罐通过校验都会
    自动依次执行域级、全局淘汰。面板中实时显示全局与各域用量（`当前条数/上限`），
    入罐结果区会展示**本次触发的淘汰清单**（过期清理 / 容量淘汰、逐条排序依据）。
@@ -264,6 +283,44 @@ Partitioned（CHIPS）演算示例（写入时填「顶层页面 URL」，发送
 
 排序后以 `; ` 拼接成 `Cookie` 请求头（RFC 6265 的 cookie 排序要求）。
 
+### document.cookie 演算（页面内 JavaScript）
+
+面板「📜 document.cookie 演算」与两个接口对应；入参为**页面 URL**、**顶层页面 URL**
+与**屏蔽第三方 Cookie 开关**。
+
+**读取（`POST /api/script/read`）** —— 模拟 `document.cookie` 取值：
+
+- 依次套用与网络请求头**完全相同的既有基础筛选**：
+  1. **过期**：已过期不可见；
+  2. **Partitioned 分区键**：分区项仅在自身分区键与请求分区键（由顶层页面 URL 计算）
+     相同时可见；
+  3. **屏蔽第三方 Cookie**（可选）：跨站页面的普通 Cookie 隐藏，分区键匹配的
+     Partitioned 项豁免；
+  4. **Domain**（host-only 精确匹配 / Domain 含子域）；
+  5. **Path**（相等或前缀边界为 `/`）；
+  6. **Secure**（仅 https 页面可见）；
+- 基础筛选通过后**再排除 HttpOnly 项**（`HttpOnly` cookie 对页面脚本不可见），
+  每一项都在隐藏明细中给出原因；
+- **不应用 SameSite**：`document.cookie` 不做 Strict/Lax/None 站点演算，跨站页面同样
+  能读到 SameSite=Strict 的非 HttpOnly 项；
+- 读取是纯操作，**不发送任何内容、不刷新任何条目的最近访问时间**（容量淘汰的 LRA 依据不变）；
+- 可见项**沿用请求头排序**（Path 长度降序、创建序号升序），以 `; ` 拼成读取字符串
+  `cookieString` 返回。
+
+**写入（`POST /api/script/write`）** —— 模拟 `document.cookie = "name=value; ..."`：
+
+- **复用网络写入的全部逻辑**：同一个 Set-Cookie 解析器、Domain/Path/Secure/SameSite/
+  Priority/Partitioned 校验、`(name, domain, path, partitionKey)` 分区存储身份、
+  默认 Path、Max-Age 覆盖更新 / 删除语义，以及入罐后的域级 → 全局容量淘汰；
+- **HttpOnly 专属限制（与网络写入的唯一差异）**：
+  - 赋值串**带 `HttpOnly` 属性 → 直接拒绝**（JS 无法设置 HttpOnly）；
+  - 同身份已存在**未过期的 HttpOnly 项**时，**拒绝覆盖**，也**拒绝 `Max-Age<=0` 删除**
+    （对齐真实浏览器：JS 赋值对该 cookie 静默无效）；
+  - 已过期的 HttpOnly 项不再受保护（按过期清理语义，脚本可覆盖/删除）；
+- 任何拒绝都**不改动罐内容、不更新创建/更新/最近访问时间戳、不触发容量淘汰**；
+- 网络接口不受这些限制：`POST /api/store` 仍可写入/覆盖/删除 HttpOnly 项，
+  `POST /api/send` 演算请求头时仍会照常带上 HttpOnly 项。
+
 ---
 
 ## 🔌 HTTP API
@@ -272,7 +329,9 @@ Partitioned（CHIPS）演算示例（写入时填「顶层页面 URL」，发送
 |------|------|--------------|------|
 | GET | `/api/jar` | — | 当前罐快照（`cookies` + `capacity`：容量设置与各可注册域用量） |
 | POST | `/api/store` | `{ "url": "...", "setCookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | 顺序写入一条 Set-Cookie；`topUrl` 为顶层页面 URL，仅 `Partitioned` cookie 必需（计算分区键），普通 cookie 可省略。`blockThirdParty=true` 开启屏蔽第三方 Cookie：此时 `topUrl` 必填且须有效，跨站响应拒绝写入/删除普通 Cookie（不改动罐、不触发容量淘汰），Partitioned 分区项不受影响。响应含 `eviction`（本次触发的域级/全局淘汰清单与排序依据，无限额时为 `null`） |
-| POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true, "blockThirdParty"?: false }` | 演算 Cookie 头与逐项原因；请求分区键由顶层页面 URL（缺省取请求 URL）计算并以 `partitionKey` 返回，仅键相同的 `Partitioned` 项发送。`blockThirdParty=true` 时 `topUrl` 必填且须有效，跨站请求排除普通 Cookie（不刷新其最近访问时间），分区键匹配的 Partitioned 项仍可发送；响应以 `blockThirdParty` 回显开关状态。发送成功的条目刷新最近访问时间，响应附最新 `cookies` 与 `capacity` |
+| POST | `/api/send` | `{ "url": "...", "topUrl"?: "...", "method"?: "GET", "topLevelNav"?: true, "blockThirdParty"?: false }` | 演算 Cookie 头与逐项原因；请求分区键由顶层页面 URL（缺省取请求 URL）计算并以 `partitionKey` 返回，仅键相同的 `Partitioned` 项发送。`blockThirdParty=true` 时 `topUrl` 必填且须有效，跨站请求排除普通 Cookie（不刷新其最近访问时间），分区键匹配的 Partitioned 项仍可发送；响应以 `blockThirdParty` 回显开关状态。**HttpOnly 项照常参与发送**。发送成功的条目刷新最近访问时间，响应附最新 `cookies` 与 `capacity` |
+| POST | `/api/script/read` | `{ "url": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | 演算页面 JS 读取 `document.cookie`：返回 `cookieString`（可见项按 Path 长度降序 / 创建序号升序以 `; ` 拼接）、`visible` 与 `hidden` 逐项明细。筛选套用过期 / 分区键 / 第三方屏蔽 / Domain / Path / Secure，**再排除 HttpOnly**；**不应用 SameSite、不刷新最近访问时间**。`blockThirdParty=true` 时 `topUrl` 必填 |
+| POST | `/api/script/write` | `{ "url": "...", "cookie": "...", "topUrl"?: "...", "blockThirdParty"?: false }` | 演算页面 JS 执行 `document.cookie = "..."`：复用 `/api/store` 的解析、分区身份与容量逻辑；**带 HttpOnly 的赋值拒绝**，覆盖 / Max-Age 删除**未过期 HttpOnly 同身份项**也拒绝（已过期的不保护）。拒绝时罐内容、时间戳与容量均不变；响应结构同 `/api/store`（`action` / `reason` / `jar` / `eviction` / `capacity`） |
 | POST | `/api/capacity` | `{ "globalLimit"?: number \| null, "domainLimits"?: { "example.com": 3 } }` | 替换式设置全局 / 每可注册域容量（正整数；`null`/缺省 = 不限），立即执行一轮淘汰并返回报告 |
 | POST | `/api/reset` | — | 清空内存罐（**容量设置保留**） |
 
@@ -317,6 +376,24 @@ curl -s -X POST http://localhost:3000/api/send \
   -d '{"url":"https://widget.vendor.com/frame",
        "topUrl":"https://embed.example.net/page", "blockThirdParty":true}'
 
+# 读取 document.cookie：与请求头同规则筛选，再排除 HttpOnly；不应用 SameSite、不刷新访问时间
+curl -s -X POST http://localhost:3000/api/script/read \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://api.shop.example.com/orders/123",
+       "topUrl":"https://other.org/"}'
+
+# document.cookie 赋值：复用入罐/分区/容量逻辑（带 HttpOnly 或覆盖未过期 HttpOnly 项会被拒绝）
+curl -s -X POST http://localhost:3000/api/script/write \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://shop.example.com/admin",
+       "cookie":"ui=dark; Path=/; Max-Age=3600"}'
+
+# 跨站页面 + 屏蔽第三方 Cookie：普通 Cookie 读取被隐藏、写入被拒绝（Partitioned 不受影响）
+curl -s -X POST http://localhost:3000/api/script/read \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://widget.vendor.com/frame",
+       "topUrl":"https://embed.example.net/page", "blockThirdParty":true}'
+
 # 设置容量：example.com 域 3 条、全局 10 条（立即按新上限执行一次淘汰）
 curl -s -X POST http://localhost:3000/api/capacity \
   -H 'Content-Type: application/json' \
@@ -341,10 +418,10 @@ curl -s -X POST http://localhost:3000/api/reset
 ├── package.json
 ├── tsconfig.json
 ├── src
-│   ├── server.ts           # Express 入口与 API（含容量设置接口）
-│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/容量淘汰）
+│   ├── server.ts           # Express 入口与 API（含容量设置、document.cookie 读写接口）
+│   └── cookieJar.ts        # 全部 Cookie 演算规则（解析/入罐/匹配/排序/SameSite/Priority/Partitioned/容量淘汰/document.cookie）
 └── public
-    ├── index.html          # 原生前端页面（含顶层 URL 输入与容量压力配置面板）
+    ├── index.html          # 原生前端页面（写入/请求/document.cookie 三面板 + 顶层 URL 与容量压力配置）
     ├── styles.css
     └── app.js
 ```
@@ -367,10 +444,13 @@ npm run dev
 
 > 说明：本工具是**演算/教学工具**，Cookie 仅存于服务端进程内存，刻意聚焦
 > Domain / Path / Max-Age / Secure / SameSite / Priority / **Partitioned（CHIPS 分区）**
-> 与容量压力淘汰等规则；
-> 不处理 HttpOnly 发送限制（仅展示标签）、Expires、单条 cookie 字节大小上限等。
+> 与容量压力淘汰等规则；Expires、单条 cookie 字节大小上限等不参与演算。
+> **HttpOnly 仅作用于 document.cookie 脚本接口**：网络写入（`/api/store`）可自由设置、
+> 覆盖、删除 HttpOnly 项，网络请求头（`/api/send`）照常发送；而
+> `/api/script/read` 读取时排除 HttpOnly（逐项说明），`/api/script/write` 拒绝 HttpOnly
+> 赋值、拒绝覆盖/删除未过期的 HttpOnly 同身份项。
 > 分区键与站点一致，取**顶层 URL 的 scheme + 可注册域**（IP、localhost 用完整主机）；
-> **屏蔽第三方 Cookie** 为可选模式（默认关闭）：开启后跨站响应拒绝写入/删除普通
-> Cookie、跨站请求排除普通 Cookie，Partitioned 分区项均不受此限。
+> **屏蔽第三方 Cookie** 为可选模式（默认关闭）：开启后跨站响应/页面拒绝写入/删除普通
+> Cookie、跨站请求/读取排除普通 Cookie，Partitioned 分区项均不受此限。
 > 容量按**条目条数**模拟（RFC 6265bis 的每可注册域 180 条、全局 3000 条同型机制），
 > 时间精度取毫秒级，同一毫秒内的次序由创建序号兜底。

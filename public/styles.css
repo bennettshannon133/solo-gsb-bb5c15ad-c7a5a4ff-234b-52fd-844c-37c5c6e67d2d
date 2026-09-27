@@ -438,6 +438,21 @@ select:focus {
 .badge.pr-medium { background: var(--blue-bg); color: var(--blue); }
 .badge.pr-low { background: rgba(154,163,181,.18); color: var(--text-dim); }
 
+/* ---------- document.cookie 脚本面板 ---------- */
+.script-card {
+  border-color: rgba(83, 155, 245, 0.35);
+}
+.script-card h2 { gap: 6px; }
+.script-card h2 code { font-size: 13px; }
+.script-card .jar-count code { color: var(--blue); }
+.script-read-row { margin-bottom: 6px; }
+.script-write-field { margin-top: 16px; }
+.header-line .hname.script-name { color: #b994f0; }
+.item.visible { border-left-color: var(--green); }
+.item.hidden { border-left-color: var(--red); opacity: 0.92; }
+.tag.visible { background: var(--green-bg); color: var(--green); }
+.tag.hidden { background: var(--red-bg); color: var(--red); }
+
 /* ---------- 底部规则 ---------- */
 .rules-note {
   padding-bottom: 40px;

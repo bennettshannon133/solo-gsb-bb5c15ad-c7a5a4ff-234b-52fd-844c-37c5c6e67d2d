@@ -20,6 +20,15 @@ const els = {
   sendBtn: $('#send-btn'),
   sendResult: $('#send-result'),
 
+  scriptUrl: $('#script-url'),
+  scriptTopUrl: $('#script-top-url'),
+  scriptBlock3p: $('#script-block-3p'),
+  scriptCookie: $('#script-cookie'),
+  scriptReadBtn: $('#script-read-btn'),
+  scriptWriteBtn: $('#script-write-btn'),
+  scriptReadResult: $('#script-read-result'),
+  scriptWriteResult: $('#script-write-result'),
+
   resetBtn: $('#reset-btn'),
   jarCount: $('#jar-count-num'),
   jarWrap: $('#jar-table-wrap'),
@@ -344,6 +353,109 @@ function renderSendResult(data) {
   if (copyBtn) copyBtn.addEventListener('click', () => copyText(data.cookieHeader));
 }
 
+/* ---------- document.cookie 读取结果 ---------- */
+
+function scriptItemHtml(item) {
+  const visible = item.verdict === 'send';
+  const partBadge = item.partitioned
+    ? `<span class="badge part-on">Partitioned · ${escapeHtml(item.partitionKey)}</span>`
+    : '';
+  const httpBadge = item.httpOnly ? '<span class="badge http">HttpOnly</span>' : '';
+  const secureBadge = item.secure ? '<span class="badge secure">Secure</span>' : '';
+  return `
+    <div class="item ${visible ? 'visible' : 'hidden'}">
+      <div class="item-top">
+        <span class="item-idx">#${item.index}</span>
+        <span class="tag ${visible ? 'visible' : 'hidden'}">${visible ? '可见' : '隐藏'}</span>
+        <span class="item-cookie">${escapeHtml(item.cookie)}</span>
+        ${httpBadge}${secureBadge}${partBadge}
+      </div>
+      <div class="item-detail">${escapeHtml(item.detail)}</div>
+    </div>`;
+}
+
+function renderScriptReadResult(data) {
+  els.scriptReadResult.classList.remove('hidden');
+
+  if (!data.ok) {
+    els.scriptReadResult.innerHTML = `
+      <div class="banner bad">
+        <span class="banner-title">⛔ 无法读取</span>${escapeHtml(data.error || '页面 URL 非法')}
+      </div>`;
+    return;
+  }
+
+  const strVal = data.cookieString
+    ? escapeHtml(data.cookieString)
+    : '<span class="dim">（空字符串：没有任何对当前页面脚本可见的 cookie）</span>';
+
+  const visibleHtml = data.visible.length
+    ? `<div class="group-title">👁️ 可见项（${data.visible.length}，已按 Path 长度降序 / 创建顺序升序排列；document.cookie 不检查 SameSite）</div>
+       <div class="item-list">${data.visible.map(scriptItemHtml).join('')}</div>`
+    : '<div class="group-title">👁️ 可见项<span class="count">（0）</span></div>';
+
+  const hiddenHtml = data.hidden.length
+    ? `<div class="group-title">🚫 隐藏项（${data.hidden.length}，含 HttpOnly 对 JS 不可见）</div>
+       <div class="item-list">${data.hidden.map(scriptItemHtml).join('')}</div>`
+    : '';
+
+  const siteBadge = data.sameSiteContext
+    ? '<span class="badge ss-same">同站</span>'
+    : '<span class="badge ss-cross">跨站</span>';
+  const blockBadge = data.blockThirdParty
+    ? '<span class="badge ss-cross">屏蔽第三方 Cookie：开</span>'
+    : '<span class="badge ss-same">屏蔽第三方 Cookie：关</span>';
+
+  els.scriptReadResult.innerHTML = `
+    <div class="meta-line">
+      页面主机 <code>${escapeHtml(data.host)}</code> ·
+      路径 <code>${escapeHtml(data.path)}</code> ·
+      协议 <strong>${data.secureRequest ? 'https（可见 Secure）' : 'http（不可见 Secure）'}</strong>
+    </div>
+    <div class="meta-line">
+      页面站 <code>${escapeHtml(data.requestSite)}</code> vs 顶层站 <code>${escapeHtml(data.topSite)}</code>
+      ${siteBadge} · ${blockBadge}
+    </div>
+    <div class="meta-line">
+      🔑 分区键（顶层页面 URL 的 scheme + 可注册域）：<code>${escapeHtml(data.partitionKey)}</code>
+      <span class="dim">读取不应用 SameSite、不刷新最近访问时间</span>
+    </div>
+    <div class="header-block">
+      <div class="header-line ${data.cookieString ? '' : 'empty'}">
+        <span class="hname script-name">document.cookie</span>
+        <span class="hval" id="script-cookie-val">${strVal}</span>
+        ${data.cookieString ? '<button class="copy-btn" id="copy-script-cookie" type="button">复制</button>' : ''}
+      </div>
+    </div>
+    ${visibleHtml}
+    ${hiddenHtml}`;
+
+  const copyBtn = $('#copy-script-cookie');
+  if (copyBtn) copyBtn.addEventListener('click', () => copyText(data.cookieString));
+}
+
+/* ---------- document.cookie 写入结果 ---------- */
+
+const SCRIPT_WRITE_BANNER = {
+  stored:   { cls: 'ok',     title: '✅ 赋值生效（已入罐）' },
+  updated:  { cls: 'update', title: '🔄 赋值生效（覆盖更新）' },
+  deleted:  { cls: 'delete', title: '🗑 赋值生效（执行删除）' },
+  rejected: { cls: 'bad',    title: '⛔ 赋值被拒绝' },
+};
+
+function renderScriptWriteResult(data) {
+  const meta = SCRIPT_WRITE_BANNER[data.action] || SCRIPT_WRITE_BANNER.rejected;
+  els.scriptWriteResult.classList.remove('hidden');
+  els.scriptWriteResult.innerHTML = `
+    <div class="banner ${meta.cls}">
+      <span class="banner-title">${meta.title}</span>${escapeHtml(data.reason)}
+    </div>
+    ${noticesHtml(data.notices)}
+    ${evictionHtml(data.eviction)}`;
+  if (data.jar) renderJar(data.jar);
+  if (data.capacity) renderCapacityUsage(data.capacity);
+}
+
 /* ---------- 事件 ---------- */
 
 els.storeBtn.addEventListener('click', async () => {
@@ -409,6 +521,65 @@ els.sendBtn.addEventListener('click', async () => {
   }
 });
 
+/* ---------- document.cookie 读取 / 写入 ---------- */
+
+els.scriptReadBtn.addEventListener('click', async () => {
+  const url = els.scriptUrl.value.trim();
+  if (!url) {
+    els.scriptReadResult.classList.remove('hidden');
+    els.scriptReadResult.innerHTML = `
+      <div class="banner bad"><span class="banner-title">⛔</span>请先填写页面 URL</div>`;
+    return;
+  }
+  els.scriptReadBtn.disabled = true;
+  try {
+    const data = await postJSON('/api/script/read', {
+      url,
+      topUrl: els.scriptTopUrl.value.trim(),
+      blockThirdParty: els.scriptBlock3p.checked,
+    });
+    renderScriptReadResult(data);
+  } catch (err) {
+    renderScriptReadResult({
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  } finally {
+    els.scriptReadBtn.disabled = false;
+  }
+});
+
+els.scriptWriteBtn.addEventListener('click', async () => {
+  const url = els.scriptUrl.value.trim();
+  const cookie = els.scriptCookie.value.trim();
+  if (!url || !cookie) {
+    renderScriptWriteResult({
+      ok: false, action: 'rejected',
+      reason: !url ? '请先填写页面 URL' : '请先填写 document.cookie 赋值串',
+      notices: [],
+    });
+    return;
+  }
+  els.scriptWriteBtn.disabled = true;
+  try {
+    const data = await postJSON('/api/script/write', {
+      url,
+      cookie,
+      topUrl: els.scriptTopUrl.value.trim(),
+      blockThirdParty: els.scriptBlock3p.checked,
+    });
+    renderScriptWriteResult(data);
+  } catch (err) {
+    renderScriptWriteResult({
+      ok: false, action: 'rejected',
+      reason: err instanceof Error ? err.message : String(err),
+      notices: [],
+    });
+  } finally {
+    els.scriptWriteBtn.disabled = false;
+  }
+});
+
 els.resetBtn.addEventListener('click', async () => {
   try {
     const data = await postJSON('/api/reset', {});
@@ -416,6 +587,8 @@ els.resetBtn.addEventListener('click', async () => {
     if (data.capacity) renderCapacityUsage(data.capacity);
     els.storeResult.classList.add('hidden');
     els.sendResult.classList.add('hidden');
+    els.scriptReadResult.classList.add('hidden');
+    els.scriptWriteResult.classList.add('hidden');
     els.capResult.classList.add('hidden');
     els.storeCookie.value = '';
     toast('Cookie 罐已重置（容量设置保留）');
@@ -567,6 +740,9 @@ els.fillDemo.addEventListener('click', () => {
   els.sendTopUrl.value = 'https://embed.example.net/page';
   els.sendMethod.value = 'GET';
   els.sendTopnav.checked = true;
+  els.scriptUrl.value = 'https://shop.example.com/admin/dashboard';
+  els.scriptTopUrl.value = 'https://embed.example.net/';
+  els.scriptCookie.value = 'ui=dark; Path=/; Max-Age=3600; Secure; SameSite=None; Partitioned';
 });
 
 /* 回车快捷提交 */
@@ -584,6 +760,15 @@ els.sendUrl.addEventListener('keydown', (e) => {
 });
 els.sendTopUrl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') els.sendBtn.click();
+});
+els.scriptUrl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.scriptReadBtn.click();
+});
+els.scriptTopUrl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.scriptReadBtn.click();
+});
+els.scriptCookie.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') els.scriptWriteBtn.click();
 });
 
 /* 初始加载 */

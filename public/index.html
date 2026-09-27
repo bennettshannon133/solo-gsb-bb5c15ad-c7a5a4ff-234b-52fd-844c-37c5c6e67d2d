@@ -97,6 +97,50 @@
 
         <div id="send-result" class="result-box hidden"></div>
       </section>
+
+      <section class="card script-card" id="script-card">
+        <h2>📜 <span>document.cookie 演算（页面内 JavaScript）</span></h2>
+        <p class="jar-count">
+          模拟当前页面执行 <code>document.cookie</code>：读取字符串按网络请求头的
+          Domain / Path / Secure / 过期 / 分区 / 第三方屏蔽既有规则筛选后，<strong>再排除 HttpOnly</strong>；
+          <strong>不应用 SameSite</strong>、<strong>不刷新最近访问时间</strong>。
+          写入复用入罐规则，但 <strong>HttpOnly 赋值 / 覆盖 / Max-Age 删除一律拒绝</strong>
+          （网络接口 <code>/api/store</code>、<code>/api/send</code> 不受此限）。
+        </p>
+
+        <label class="field">
+          <span class="field-label">页面 URL（执行 <code>document.cookie</code> 的页面地址）</span>
+          <input id="script-url" type="text" spellcheck="false" autocomplete="off"
+            placeholder="例如：https://shop.example.com/admin/dashboard" />
+        </label>
+
+        <label class="field">
+          <span class="field-label">顶层页面 URL（分区键与跨站判定基准；留空 = 与页面 URL 同站/同分区）</span>
+          <input id="script-top-url" type="text" spellcheck="false" autocomplete="off"
+            placeholder="例如：https://embed.example.net/（跨站嵌入第三方页面时）" />
+        </label>
+
+        <label class="field-nav" title="对应 /api/script/read 与 /api/script/write 的 blockThirdParty 参数">
+          <input id="script-block-3p" type="checkbox" />
+          <span>屏蔽第三方 Cookie（须填有效顶层页面 URL：<strong>跨站页面读取排除普通 Cookie、写入/删除普通 Cookie 被拒绝</strong>；
+            分区键匹配的 Partitioned 项不受此限）</span>
+        </label>
+
+        <div class="script-read-row">
+          <button id="script-read-btn" class="btn primary" type="button">读取 document.cookie</button>
+        </div>
+        <div id="script-read-result" class="result-box hidden"></div>
+
+        <label class="field script-write-field">
+          <span class="field-label">写入赋值串（等价于 <code>document.cookie = "..."</code>，不含前缀；带 <code>HttpOnly</code> 会被拒绝）</span>
+          <input id="script-cookie" type="text" spellcheck="false" autocomplete="off"
+            placeholder='例如：ui=dark; Path=/; Max-Age=3600; Secure; SameSite=None; Partitioned' />
+        </label>
+        <div class="row">
+          <button id="script-write-btn" class="btn primary" type="button">执行 document.cookie 赋值</button>
+        </div>
+        <div id="script-write-result" class="result-box hidden"></div>
+      </section>
     </div>
 
     <!-- 右列：容量压力 + 罐子 -->
@@ -158,6 +202,7 @@
         <li><strong>站点（site）：</strong>scheme + 可注册域（eTLD+1，由公共后缀列表 PSL 判定，如 <code>https://example.com</code>）；IP 与 localhost 按完整主机比较。请求站 = 顶层站即「同站」。</li>
         <li><strong>发送限制：</strong><code>Strict</code> 仅同站发送；显式 <code>Lax</code> 仅同站或跨站顶层导航的安全方法（GET/HEAD/OPTIONS/TRACE）发送；<strong>默认 Lax</strong> 额外允许创建不超过 <strong>120 秒</strong>的跨站顶层 POST；<code>None</code> 跨站照常发送（已强制 Secure）。</li>
         <li><strong>屏蔽第三方 Cookie（可选，默认关闭）：</strong>界面开关与 <code>/api/store</code>、<code>/api/send</code> 的 <code>blockThirdParty</code> 参数一一对应。开启后<strong>必须提供有效顶层页面 URL</strong>，按 scheme + 可注册域判定它与响应/请求 URL 是否跨站：<strong>跨站响应拒绝写入和删除普通 Cookie</strong>（不改动罐、不触发容量淘汰），Partitioned 分区项仍按既有 Secure 与分区键规则处理；<strong>跨站请求排除普通 Cookie</strong>（被排除条目不刷新最近访问时间），分区键匹配的 Partitioned 项仍可发送。拒绝/排除结果逐项说明策略原因。</li>
+        <li><strong>document.cookie 演算（📜 页面脚本面板，<code>/api/script/read</code>、<code>/api/script/write</code>）：</strong>读取按<strong>既有 Domain、Path、Secure、过期、Partitioned 分区键与第三方屏蔽规则</strong>筛选后，<strong>再排除 HttpOnly 项</strong>（逐项说明隐藏原因）；<strong>不应用 SameSite</strong>（document.cookie 不做站点演算）；读取是纯操作，<strong>不刷新最近访问时间</strong>；可见项<strong>沿用请求头排序</strong>（Path 长度降序、创建序号升序）拼成读取字符串。写入（<code>document.cookie = "..."</code>）复用网络写入的解析、分区身份与容量逻辑，但：赋值串<strong>带 HttpOnly 直接拒绝</strong>；同身份（name, domain, path[, 分区键]）已存在<strong>未过期 HttpOnly 项</strong>时，<strong>拒绝覆盖、也拒绝 Max-Age&lt;=0 删除</strong>（已过期的 HttpOnly 项不再保护）。任何拒绝<strong>都不改动罐内容、时间戳与容量</strong>。网络接口 <code>/api/store</code> 仍可写入/更新 HttpOnly 项、<code>/api/send</code> 仍会发送它们。</li>
         <li><strong>排序：</strong>发送时按 Path 长度降序，Path 等长时按首次创建顺序升序，再以 <code>; </code> 拼接成 Cookie 头。</li>
       </ul>
     </details>

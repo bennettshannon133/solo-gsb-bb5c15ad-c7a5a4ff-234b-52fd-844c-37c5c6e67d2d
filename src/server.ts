@@ -7,10 +7,18 @@
  *   POST /api/store              { url, setCookie, topUrl?, blockThirdParty? } 顺序处理一次 Set-Cookie 写入（含容量压力淘汰）；
  *                                topUrl 为顶层页面 URL，仅 Partitioned cookie 必需（计算分区键）；
  *                                blockThirdParty=true 开启「屏蔽第三方 Cookie」：topUrl 必填，
- *                                跨站响应拒绝写入/删除普通 Cookie（Partitioned 分区项不受此限）
- *   POST /api/send               { url, topUrl?, method?, topLevelNav?, blockThirdParty? } 演算请求 Cookie 头；
+ *                                跨站响应拒绝写入/删除普通 Cookie（Partitioned 分区项不受此限）。
+ *                                网络接口可写入、覆盖、删除并在 /api/send 发送 HttpOnly 项。
+ *   POST /api/send               { url, topUrl?, method?, topLevelNav?, blockThirdParty? } 演算请求 Cookie 头（含 HttpOnly 项）；
  *                                blockThirdParty=true 时 topUrl 必填，跨站请求排除普通 Cookie
  *                                （分区键匹配的 Partitioned 项仍可发送）
+ *   POST /api/script/read        { url, topUrl?, blockThirdParty? } 演算页面 JS 读取 document.cookie：
+ *                                套用过期/分区/第三方/Domain/Path/Secure 既有筛选，再排除 HttpOnly；
+ *                                不应用 SameSite，不刷新最近访问时间；返回可见项拼成的读取字符串与逐项隐藏原因
+ *   POST /api/script/write       { url, cookie, topUrl?, blockThirdParty? } 演算页面 JS 执行 document.cookie = "..."：
+ *                                复用网络写入的解析/分区身份/容量逻辑，但拒绝带 HttpOnly 的赋值，
+ *                                以及对同身份未过期 HttpOnly 项的覆盖或 Max-Age 删除；
+ *                                拒绝时罐内容、时间戳与容量不变
  *   POST /api/capacity           { globalLimit?, domainLimits? } 设置全局/每可注册域容量并立即执行淘汰
  *   POST /api/reset              清空内存罐（容量设置保留）
  *
@@ -104,6 +112,79 @@ app.post('/api/send', (req, res) => {
   });
   // 发送成功的条目会刷新最近访问时间，故把最新罐内容与用量一并返回
   res.json({ ...result, capacity: jar.capacity(), cookies: jar.list() });
+});
+
+/** /api/script/read 与 /api/script/write 共用的 url / topUrl / blockThirdParty 字段校验 */
+function validateScriptBody(body: {
+  url?: unknown;
+  topUrl?: unknown;
+  blockThirdParty?: unknown;
+}, res: express.Response, urlFieldLabel: string): { url: string; topUrl: string | undefined; blockThirdParty: boolean } | null {
+  const { url, topUrl, blockThirdParty } = body;
+  if (typeof url !== 'string' || url.trim() === '') {
+    res.status(400).json({ ok: false, error: `缺少${urlFieldLabel}（字段 url）` });
+    return null;
+  }
+  if (topUrl !== undefined && typeof topUrl !== 'string') {
+    res.status(400).json({ ok: false, error: '顶层页面 URL（字段 topUrl）必须是字符串' });
+    return null;
+  }
+  if (blockThirdParty !== undefined && typeof blockThirdParty !== 'boolean') {
+    res.status(400).json({ ok: false, error: '屏蔽第三方 Cookie 开关（字段 blockThirdParty）必须是布尔值' });
+    return null;
+  }
+  return {
+    url: url.trim(),
+    topUrl: typeof topUrl === 'string' && topUrl.trim() !== '' ? topUrl.trim() : undefined,
+    blockThirdParty: blockThirdParty === true,
+  };
+}
+
+interface ScriptReadBody {
+  url?: unknown;
+  topUrl?: unknown;
+  blockThirdParty?: unknown;
+}
+
+// 演算页面 JS 读取 document.cookie（不应用 SameSite、不刷新最近访问时间、排除 HttpOnly）
+app.post('/api/script/read', (req, res) => {
+  const parsed = validateScriptBody((req.body ?? {}) as ScriptReadBody, res, '页面 URL');
+  if (!parsed) return;
+  const result = jar.readScript(parsed.url, {
+    topUrl: parsed.topUrl,
+    blockThirdParty: parsed.blockThirdParty,
+  });
+  // 纯读取：不修改罐，也不刷新任何时间戳
+  res.json(result);
+});
+
+interface ScriptWriteBody {
+  url?: unknown;
+  cookie?: unknown;
+  topUrl?: unknown;
+  blockThirdParty?: unknown;
+}
+
+// 演算页面 JS 写入 document.cookie（HttpOnly 赋值 / 覆盖 / 删除被拒绝，其余复用网络写入逻辑）
+app.post('/api/script/write', (req, res) => {
+  const body = (req.body ?? {}) as ScriptWriteBody;
+  const parsed = validateScriptBody(
+    { url: body.url, topUrl: body.topUrl, blockThirdParty: body.blockThirdParty },
+    res,
+    '页面 URL',
+  );
+  if (!parsed) return;
+  if (typeof body.cookie !== 'string' || body.cookie.trim() === '') {
+    res.status(400).json({
+      ok: false,
+      error: '缺少 document.cookie 赋值串（字段 cookie），形如 "name=value; Path=/; Max-Age=3600"，一次只能提交一条',
+    });
+    return;
+  }
+  const result = jar.writeScript(parsed.url, body.cookie, parsed.topUrl, {
+    blockThirdParty: parsed.blockThirdParty,
+  });
+  res.json({ ...result, capacity: jar.capacity() });
 });
 
 interface CapacityBody {
